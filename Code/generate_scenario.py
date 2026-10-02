@@ -4,31 +4,27 @@ import numpy as np
 import pandas as pd
 
 
-def get_data(L, K, N, tau_p, ASD_varphi, numActiveAPs, grid, semilla=False, N_max=20):
+def get_data(L, K, N, tau_p, ASD_varphi, numActiveAPs, grid, semilla=False, N_max=20,
+             interference_scope="all"):
 
     # Llamamos a la función para generar los parámetros del entorno
     gainOverNoisedB, powgain, active_APs, distances, pilotIndex = generateSetup(
         L=L, K=K, N=N, tau_p=tau_p, ASD_varphi=ASD_varphi, numActiveAPs=numActiveAPs, grid=grid, semilla=semilla
     )
     max_gain = np.max(powgain)
-    # ----------------------------------------------------------------------------------------------------------------
 
-    # -------------------------- MODIFIED --------------------------------
-    # Interference matrix, scoped to only the UEs that actually compete
-    # for the same AP (i.e. share it as an active AP), not the whole
-    # network. Summing every UE in the network - as the original
-    # interference_sum column did - inflates the term with UEs that would
-    # never realistically be scheduled through that AP, and at realistic
-    # scale (30 UEs) that inflation pushed ~87% of UEs to a net-negative
-    # weight before the graph was even built. Scoping to only "serving"
-    # UEs (those with l in their own active_APs) fixes that.
-    serving = np.zeros((L, K), dtype=bool)
-    for k in range(K):
-        serving[active_APs[k], k] = True
+    if interference_scope == "all":
+        considered = np.ones((L, K), dtype=bool)
+    elif interference_scope == "serving":
+        considered = np.zeros((L, K), dtype=bool)
+        for k in range(K):
+            considered[active_APs[k], k] = True
+    else:
+        raise ValueError(f"interference_scope must be 'all' or 'serving', got {interference_scope!r}")
 
-    serving_power = serving * powgain                       # (L, K), zero where UE k doesn't use AP l
-    total_serving_power = serving_power.sum(axis=1, keepdims=True)  # (L, 1)
-    interference_matrix = total_serving_power - serving_power       # (L, K), own contribution subtracted
+    considered_power = considered * powgain                              # (L, K)
+    total_power = considered_power.sum(axis=1, keepdims=True)            # (L, 1)
+    interference_matrix = total_power - powgain * considered             # (L, K), own contribution subtracted
 
     # Inicializar la lista para almacenar los datos
     data = []
@@ -61,11 +57,6 @@ def get_data(L, K, N, tau_p, ASD_varphi, numActiveAPs, grid, semilla=False, N_ma
     df_simulation = pd.DataFrame(data)
     # print(df_simulation.head(21))
 
-    # -------------------------- MODIFIED --------------------------------
-    # pilotIndex and interference_matrix are now returned too: the conflict
-    # graph builder needs both directly (pilotIndex for pilot-contamination
-    # edges, interference_matrix as the AP-capacity/weight input), not just
-    # the per-row normalized version baked into df_simulation.
     return active_APs, df_simulation, gainOverNoisedB, powgain, max_gain, pilotIndex, interference_matrix
 
 # get_data(50, 30, 1, 4, 10 * (3.14159 / 180), 10, grid=True, semilla=1)
