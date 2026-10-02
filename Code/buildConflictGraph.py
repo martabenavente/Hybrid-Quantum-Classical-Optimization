@@ -3,110 +3,131 @@ import networkx as nx
 import numpy as np
 
 
+def link_sinr(powgain, interference_matrix, k, l):
+    """SINR of the link AP l -> UE k (linear)."""
+    return float(powgain[l, k] / (1 + interference_matrix[l, k]))
+
+
+def link_weight(powgain, interference_matrix, k, l):
+    """Spectral efficiency of the link AP l -> UE k: log2(1 + SINR)."""
+    return float(np.log2(1 + link_sinr(powgain, interference_matrix, k, l)))
+
+
 def build_conflict_graph(
     active_APs,
     powgain,
     gainOverNoisedB,
     pilotIndex,
     interference_matrix,
-    T,                    ## number of timeslots
-    tau_db=3.0,            ## interference threshold for a pilot contamination edge
+    N=1,                  ## antennas per AP
+    tau_db=3.0,           ## gain margin (dB) for a pilot contamination edge
+    pilot_edges=False,    ## pilot contamination family: off by default, redundant when N=1
 ):
     """
-    Returns G: graph where edges connect incompatible nodes.
+    Returns G: graph whose nodes are (UE, AP) links and whose edges connect
+    links that cannot share a timeslot.
     """
 
     K = active_APs.shape[0]
-    active_AP_sets = [set(int(l) for l in active_APs[k]) for k in range(K)]
 
-    G = nx.Graph()
+    G = nx.Graph(capacity=N)
 
-    ## Compute weight (spectral efficiency)
-    node_weight = {}
+    ## Build nodes: one per (UE, AP) link in the UE's active cluster
+    links_by_ap = {}
     for k in range(K):
-        w = sum(
-            np.log2(1 + powgain[l, k] / (1 + interference_matrix[l, k]))
-            for l in active_AP_sets[k]
-        )
-        node_weight[k] = w
+        for l in active_APs[k]:
+            l = int(l)
+            node = (k, l)
+            G.add_node(
+                node,
+                ue=k,
+                ap=l,
+                weight=link_weight(powgain, interference_matrix, k, l),
+                sinr_db=float(10 * np.log10(link_sinr(powgain, interference_matrix, k, l))),
+                pilot=int(pilotIndex[k]),
+            )
+            links_by_ap.setdefault(l, []).append(node)
 
-    ## Build nodes 
-    nodes_by_slot = {t: [] for t in range(T)}
-    for k, w in node_weight.items():
-        for t in range(T):
-            node = (k, t)
-            G.add_node(node, weight=w)
-            nodes_by_slot[t].append(node)
+    def add_conflict(n1, n2, kind):
+        if G.has_edge(n1, n2):
+            G.edges[n1, n2]["kinds"].add(kind)
+        else:
+            G.add_edge(n1, n2, kinds={kind})
 
-    ## UE exclusivity: same k, different t
-    for k in node_weight:
-        for t1, t2 in itertools.combinations(range(T), 2):
-            G.add_edge((k, t1), (k, t2))
-
-    ## AP capacity and pilot contamination: 2 UEs, same t, same AP; and same pilto, same AP
-    ## (they overlap rn because N=1)
-    for t in range(T):
-        for n1, n2 in itertools.combinations(nodes_by_slot[t], 2):
+    ## Same AP: AP capacity and pilot contamination both live on links that share an AP
+    for l, links in links_by_ap.items():
+        for n1, n2 in itertools.combinations(links, 2):
             k1, k2 = n1[0], n2[0]
-            shared_APs = active_AP_sets[k1] & active_AP_sets[k2]
-            if not shared_APs:
-                continue
 
+            ## AP capacity (pairwise only valid for N = 1)
+            if N == 1:
+                add_conflict(n1, n2, "ap_capacity")
 
-            G.add_edge(n1, n2)
-
-
-            if pilotIndex[k1] == pilotIndex[k2]:
-                for l in shared_APs:
-                    interference_db = gainOverNoisedB[l, k2] - gainOverNoisedB[l, k1]
-                    if interference_db > -tau_db:
-                        G.add_edge(n1, n2)
-                        break
+            ## Pilot contamination: same pilot at the same AP, comparable gain.
+            if pilot_edges and pilotIndex[k1] == pilotIndex[k2]:
+                interference_db = gainOverNoisedB[l, k2] - gainOverNoisedB[l, k1]
+                if interference_db > -tau_db:
+                    add_conflict(n1, n2, "pilot")
 
     return G
 
 
-# def greedy_mwis(G):
-#     """
-#     Algorithm 2 (Appendix A, arXiv:2301.02637): iterative greedy maximum
-#     weighted independent set extraction.
-#     """
+def good_links(G, margin_db=3.0):
+    """
+    Good"¡ links: SINR within margin_db of their UE's best link.
+    """
+    best = {}
+    for _, d in G.nodes(data=True):
+        best[d["ue"]] = max(best.get(d["ue"], -np.inf), d["sinr_db"])
+    return {n for n, d in G.nodes(data=True) if d["sinr_db"] >= best[d["ue"]] - margin_db}
 
-#     H = G.copy()
-#     selected = []
 
-#     while H.number_of_nodes() > 0:
-#         node = max(H.nodes, key=lambda n: H.nodes[n]["weight"])
-#         selected.append(node)
-#         neighbors = list(H.neighbors(node))
-#         H.remove_node(node)
-#         H.remove_nodes_from(neighbors)
-
-#     return selected
+def ap_load(G):
+    """Number of UEs competing for each AP."""
+    load = {}
+    for _, data in G.nodes(data=True):
+        load[data["ap"]] = load.get(data["ap"], 0) + 1
+    return load
 
 
 if __name__ == "__main__":
 
     from generate_scenario import get_data
 
-    K, T = 15, 3  ## 15 UEs x 3 slots = 45 nodes
+    configs = [
+        dict(K=10, numActiveAPs=5),   ## 50 links
+        dict(K=15, numActiveAPs=3),   ## 45 links
+    ]
+    L, T = 30, 3   ## more APs than UEs in both configs
 
-    active_APs, df_simulation, gainOverNoisedB, powgain, max_gain, pilotIndex, interference_matrix = get_data(
-        L=30, K=K, N=1, tau_p=4, ASD_varphi=10 * (3.14159 / 180), numActiveAPs=5, grid=True, semilla=2
-    )
+    for cfg in configs:
+        K, A = cfg["K"], cfg["numActiveAPs"]
 
-    G = build_conflict_graph(
-        active_APs, powgain, gainOverNoisedB, pilotIndex, interference_matrix,
-        T=T, tau_db=3.0,
-    )
+        active_APs, df_simulation, gainOverNoisedB, powgain, max_gain, pilotIndex, interference_matrix = get_data(
+            L=L, K=K, N=1, tau_p=4, ASD_varphi=10 * (3.14159 / 180), numActiveAPs=A, grid=True, semilla=2
+        )
 
-    print(f"Target size: K={K} x T={T} = {K*T} nodes")
-    print(f"Actual graph: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
+        G = build_conflict_graph(
+            active_APs, powgain, gainOverNoisedB, pilotIndex, interference_matrix,
+            N=1, tau_db=3.0,
+        )
 
-    print("\nNodes (k, t) and weights (bits/s/Hz):")
-    for node, data in sorted(G.nodes(data=True)):
-        print(f"  {node}: weight={data['weight']:.4f}")
+        load = ap_load(G)
+        shared = {l: n for l, n in load.items() if n > 1}
 
-    print("\nEdges (conflicts):")
-    for n1, n2 in G.edges():
-        print(f"  {n1} -- {n2}")
+        print("=" * 70)
+        print(f"K={K} UEs x {A} active APs  (L={L}, T={T})")
+        print(f"  Expected nodes: {K*A}   Actual: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
+        n_pilot = sum("pilot" in d["kinds"] for _, _, d in G.edges(data=True))
+        print(f"  Edges also tagged as pilot contamination: {n_pilot}")
+        print(f"  APs used: {len(load)} of {L}   shared APs: {len(shared)}   "
+              f"max UEs on one AP: {max(load.values())}")
+
+        weights = [d["weight"] for _, d in G.nodes(data=True)]
+        print(f"  Link weights (bits/s/Hz): min={min(weights):.3f}  "
+              f"mean={np.mean(weights):.3f}  max={max(weights):.3f}")
+
+        print("  Links per UE (AP: weight):")
+        for k in range(K):
+            row = ", ".join(f"{l}: {G.nodes[(k, int(l))]['weight']:.2f}" for l in active_APs[k])
+            print(f"    UE {k:2d} (pilot {pilotIndex[k]}): {row}")
