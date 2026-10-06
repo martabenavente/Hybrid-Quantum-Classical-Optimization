@@ -1,184 +1,235 @@
+import itertools
 import time
-import numpy as np
+
 import networkx as nx
+import numpy as np
 
-from buildConflictGraph import good_links
-
-
-def _ues(G):
-    return sorted({d["ue"] for _, d in G.nodes(data=True)})
+from buildConflictGraph import build_antenna_subgraph, antenna_range
 
 
-def can_cover(ues, links, cap, blocked=frozenset()):
+def greedy_mwis(G, weights):
     """
-    Matching check: can every UE get its own AP from links?
+    Classical WEIGHTED_MIS oracle: heaviest first, then fewest conflicts, then
+    closest to the antenna. No capacity yet.
     """
-    ues = list(ues)
-    if not ues:
-        return True
-    ue_nodes = [("ue", k) for k in ues]
-    ue_set = set(ues)
-    B = nx.Graph()
-    B.add_nodes_from(ue_nodes)
-    for (k, l) in links:
-        if k in ue_set and (k, l) not in blocked:
-            for c in range(cap.get(l, 0)):
-                B.add_edge(("ue", k), ("ap", l, c))
-    matching = nx.bipartite.hopcroft_karp_matching(B, top_nodes=ue_nodes)
-    return all(u in matching for u in ue_nodes)
-
-
-def greedy_covering_mwis(G, weights, N):
-    """
-    Classical oracle for one slot: a high weight independent set of links that
-    covers every UE and respects AP capacity N.
-    """
-    links = list(G.nodes)
-    cap = {G.nodes[n]["ap"]: N for n in links}
-    uncovered = set(_ues(G))
-
-    if not can_cover(uncovered, links, cap):
-        return None, "No assignment covers every UE (more UEs than reachable AP capacity)"
-
     chosen, blocked = [], set()
-    for link in sorted(links, key=lambda n: (-weights[n], n)):
-        k, l = link
-        if link in blocked or cap[l] == 0:
+    for k in sorted(G.nodes, key=lambda k: (-weights[k], G.degree(k), G.nodes[k]["dist"], k)):
+        if k in blocked:
             continue
-        nbrs = set(G.neighbors(link))
-        cap[l] -= 1
-        if can_cover(uncovered - {k}, links, cap, blocked | nbrs):
-            chosen.append(link)
-            blocked |= nbrs
-            uncovered.discard(k)
-        else:
-            cap[l] += 1
-
-    if uncovered:
-        return None, f"UEs {sorted(uncovered)} could not be covered"
-    return sorted(chosen), None
+        chosen.append(k)
+        blocked |= set(G.neighbors(k))
+    return chosen
 
 
-
-class PFScheduler:
-    """PF scheduler: call step(G) once per slot."""
-
-    def __init__(self, beta=0.5, eps=1e-6, good_margin_db=3.0, oracle=greedy_covering_mwis):
-        self.beta = beta
-        self.eps = eps
-        self.good_margin_db = good_margin_db
-        self.oracle = oracle
-        self.avg_rate = {}          ## UE: exponential moving average of its rate
-
-    def pf_weights(self, G):
-        for k in _ues(G):
-            self.avg_rate.setdefault(k, self.eps)   ## new UE: top priority
-        pf = {n: d["weight"] / self.avg_rate[d["ue"]] for n, d in G.nodes(data=True)}
-        good = good_links(G, self.good_margin_db)
-        if len(good) == len(pf):
-            return pf
-        ## No good links: keep their order by SE, but scale them strictly below the
-        ## weakest good link, so they can only take an AP that no good link wants.
-        floor = min(pf[n] for n in good)
-        max_se = max(G.nodes[n]["weight"] for n in pf if n not in good) or 1.0
-        for n in pf:
-            if n not in good:
-                pf[n] = 0.5 * floor * G.nodes[n]["weight"] / max_se
-        return pf
-
-    def step(self, G):
-        N = G.graph.get("capacity", 1)
-        weights = self.pf_weights(G)
-        chosen, why = self.oracle(G, weights, N)
-        if chosen is None:
-            return None, why
-        rate = {k: 0.0 for k in _ues(G)}
-        for n in chosen:
-            rate[n[0]] += G.nodes[n]["weight"]
-        for k, r in rate.items():
-            self.avg_rate[k] = (1 - self.beta) * self.avg_rate[k] + self.beta * r
-        return chosen, None
+## Pruning policies: the user with the largest score is dropped first
+PRUNE_POLICIES = {
+    "furthest":      lambda G, w, k: G.nodes[k]["dist"],
+    "lowest_weight": lambda G, w, k: -w[k],
+}
 
 
-def pf_schedule(G, T, beta=0.5, eps=1e-6, good_margin_db=3.0, oracle=greedy_covering_mwis):
+def _capacity(capacity, a):
+    return int(capacity[a]) if np.ndim(capacity) else int(capacity)
+
+
+## Serve the users left out, if possible, moving as few as possible.
+##Keeping a user on its antenna costs 0, any other link, 1000 + dist in m.
+def repair_coverage(scenario, M, capacity, range_m, compatible=None, constraints=()):
     """
-    Schedule T consecutive slots on G with the PF scheduler.
+    Returns (M_repaired {uid: antenna}, feasible: every user can be served,
+             applied: False if discarded because of a constraint).
+    """
+    D = scenario["distances"]
+    L, K = D.shape
+    uids = [int(u) for u in scenario["uids"]]
+
+    F = nx.DiGraph()
+    for k in range(K):
+        F.add_edge("src", ("u", k), capacity=1, weight=0)
+        for a in range(L):
+            if D[a, k] <= antenna_range(range_m, a) and (compatible is None or compatible(k, a, scenario)):
+                cost = 0 if M.get(uids[k]) == a else 1000 + int(round(D[a, k]))
+                F.add_edge(("u", k), ("a", a), capacity=1, weight=cost)
+    for a in range(L):
+        F.add_edge(("a", a), "snk", capacity=_capacity(capacity, a), weight=0)
+
+    flow = nx.max_flow_min_cost(F, "src", "snk")
+    R = {uids[k]: node[1] for k in range(K) if ("u", k) in flow
+         for node, f in flow[("u", k)].items() if f}
+    feasible = len(R) == K
+
+    if constraints:
+        seat = {u: k for k, u in enumerate(uids)}
+        by_antenna = {}
+        for u, a in R.items():
+            by_antenna.setdefault(a, []).append(seat[u])
+        for a, ks in by_antenna.items():
+            for u, v in itertools.combinations(ks, 2):
+                if any(check(u, v, a, scenario) for _, _, check in constraints):
+                    return dict(M), feasible, False
+    return R, feasible, True
+
+
+def assign_users_to_antennas(scenario, capacity=4, range_m=200.0, M_prev=None, beta=1.0, prune="furthest",
+                             constraints=(), compatible=None, base_weight=None, oracle=greedy_mwis,
+                             repair=True):
+    """
+    One timeslot of AssignUsersToAntennas.
+
+    Returns (M_s {uid: antenna}, unserved [uid], info).
+     Info:
+      antennas:  {antenna: (|V_a|, |MIS|, |S|)}
+      status:    "all served" | "repaired" (repair served everyone)
+                | "max coverage" (serving everyone is impossible in this slot)
+                | "repair discarded" (it broke a constraint) | "unserved" (repair off)
+      moved, added   
+      users moved to another antenna / newly served by the repair
+    """
+    uids = [int(u) for u in scenario["uids"]]
+    K, L = len(uids), scenario["distances"].shape[0]
+    score = PRUNE_POLICIES[prune] if isinstance(prune, str) else prune
+
+    ## 1. Setup
+    present = set(uids)
+    M_prev = {u: a for u, a in (M_prev or {}).items() if u in present}   ## drop users who left
+    n_prior = {a: 0 for a in range(L)}
+    for a in M_prev.values():
+        n_prior[a] += 1
+    n_range = (scenario["distances"] <= np.array([antenna_range(range_m, a) for a in range(L)])[:, None]).sum(axis=1)
+    order = sorted(range(L), key=lambda a: (-n_prior[a], -n_range[a], a))   ## most prior users first
+    unassigned, M_s, per_antenna = set(range(K)), {}, {}
+
+    ## 2. Antenna loop
+    for a in order:
+        if not unassigned:
+            break
+
+        ## ub graph of a
+        G = build_antenna_subgraph(a, sorted(unassigned), scenario, range_m, constraints, compatible)
+        if G.number_of_nodes() == 0:
+            continue
+
+        ## Weights, boost for users served by a in the previous slot.
+        w = {k: 1.0 if base_weight is None else float(base_weight(k, a, scenario)) for k in G.nodes}
+        prior = {k for k in G.nodes if M_prev.get(uids[k]) == a}
+        if beta > 1:
+            for k in prior:
+                w[k] *= beta
+
+        ## Maximum weighted independent set
+        S = list(oracle(G, w))
+        n_mis = len(S)
+
+        ## Capacity: drop by policy. Ties drop users not in Prior_a first, then the furthest
+        while len(S) > _capacity(capacity, a):
+            S.remove(max(S, key=lambda k: (score(G, w, k), k not in prior, G.nodes[k]["dist"], k)))
+
+
+        for k in S:
+            M_s[uids[k]] = a
+        unassigned -= set(S)
+        per_antenna[a] = (G.number_of_nodes(), n_mis, len(S))
+
+    ## 3. Repair.
+    info = {"antennas": per_antenna, "status": "all served", "moved": 0, "added": 0}
+    if unassigned:
+        if repair:
+            R, feasible, applied = repair_coverage(scenario, M_s, capacity, range_m, compatible, constraints)
+            info["moved"] = sum(1 for u, a in R.items() if u in M_s and M_s[u] != a)
+            info["added"] = sum(1 for u in R if u not in M_s)
+            M_s = R
+            if not applied:
+                info["status"] = "repair discarded"   ## it broke a constraint edge
+            else:
+                info["status"] = "repaired" if feasible else "max coverage"
+        else:
+            info["status"] = "unserved"
+
+
+    unserved = [u for u in uids if u not in M_s]
+    return M_s, unserved, info
+
+
+def schedule_assignment(snapshots, capacity=4, range_m=200.0, beta=1.0, prune="furthest", constraints=(),
+                        compatible=None, base_weight=None, oracle=greedy_mwis, repair=True):
+    """
+    Run AssignUsersToAntennas over consecutive timeslots.
 
     Returns dict:
-      schedule         {t: [(ue, ap), ...]}   links active in slot t
-      status, reason
-      avg_rate         {t: {ue: avg rate after t}}
-      runtime_s
+      mapping    {t: {uid: antenna}}
+      unserved   {t: [uid, ...]}
+      info       {t: info of assign_users_to_antennas (per antenna sizes, status, moved, added)}
+      status     {t: status}: "all served", "repaired", "max coverage" or "unserved"
+      snapshots, parameters, runtime_s
     """
     start = time.perf_counter()
-    sched = PFScheduler(beta=beta, eps=eps, good_margin_db=good_margin_db, oracle=oracle)
-    schedule, avg_rate = {}, {}
-    status, reason = "ok", None
-
-    for t in range(T):
-        chosen, why = sched.step(G)
-        if chosen is None:
-            status, reason = "infeasible", f"slot {t}: {why}"
-            break
-        schedule[t] = chosen
-        avg_rate[t] = dict(sched.avg_rate)
+    mapping, unserved, info = {}, {}, {}
+    M_prev = None
+    for t, s in enumerate(snapshots):
+        mapping[t], unserved[t], info[t] = assign_users_to_antennas(
+            s, capacity, range_m, M_prev=M_prev, beta=beta, prune=prune, constraints=constraints,
+            compatible=compatible, base_weight=base_weight, oracle=oracle, repair=repair,
+        )
+        M_prev = mapping[t]
 
     return {
-        "schedule": schedule,
-        "T": T,
-        "N": G.graph.get("capacity", 1),
+        "mapping": mapping,
+        "unserved": unserved,
+        "info": info,
+        "status": {t: i["status"] for t, i in info.items()},
+        "snapshots": snapshots,
+        "T": len(snapshots),
+        "capacity": capacity,
+        "range_m": range_m,
         "beta": beta,
-        "good_margin_db": good_margin_db,
-        "status": status,
-        "reason": reason,
-        "avg_rate": avg_rate,
+        "prune": prune if isinstance(prune, str) else getattr(prune, "__name__", "custom"),
+        "repair": repair,
+        "constraints": constraints,
+        "compatible": compatible,
         "runtime_s": time.perf_counter() - start,
     }
 
 
 if __name__ == "__main__":
 
-    from generate_scenario import get_data
-    from buildConflictGraph import build_conflict_graph
-    from evaluate import evaluate, print_report
+    from dynamic_scenario import DynamicScenario, CARRIER_HZ
+    from buildConflictGraph import nearest_antennas
+    from evaluate import evaluate_assignment, print_report_assignment, print_assignment
 
-    configs = [
-        dict(K=10, numActiveAPs=5),   ## 50 links
-        dict(K=15, numActiveAPs=3),   ## 45 links
-    ]
-    L, N, BETA, MARGIN = 30, 1, 0.5, 3.0
-    T_DETAIL, T_LONG = 3, 10
+    ## Scenario
+    K          = 60
+    L          = 30
+    T          = 10
+    SEED       = 2
+    CHANGE     = (0.2, 0.5)
+    CHURN      = 0.5
+    MAX_MOVE_M = 90.0          ## pedestrians in ~1 min
 
-    variants = [
-        ("no fairness",           dict(beta=0.0,  good_margin_db=np.inf)),
-        ("PF, all links",         dict(beta=BETA, good_margin_db=np.inf)),
-        (f"PF, good links {MARGIN:g}dB", dict(beta=BETA, good_margin_db=MARGIN)),
-    ]
+    ## Antennas
+    CAPACITY   = 4  
+    RANGE_M    = 200.0
 
-    for cfg in configs:
-        K, A = cfg["K"], cfg["numActiveAPs"]
-        active_APs, _, gainOverNoisedB, powgain, _, pilotIndex, interference_matrix = get_data(
-            L=L, K=K, N=N, tau_p=4, ASD_varphi=10 * (3.14159 / 180), numActiveAPs=A, grid=True, semilla=2
-        )
-        G = build_conflict_graph(active_APs, powgain, gainOverNoisedB, pilotIndex,
-                                 interference_matrix, N=N)
+    ## Solver
+    BETA       = 1.0           ## > 1 favours users the antenna served in the previous slot
+    PRUNE      = "furthest"    ## or "lowest_weight"
+    NEAREST    = None          ## int: an antenna only takes users for which it is one of their nearest
+    REPAIR     = True          ## serve every user when possible
+    MAX_SE     = 5.55          ## bits/s/Hz cap (uplink 64QAM); None = Shannon
 
-        ## Full schedule
-        label, params = variants[-1]
-        result = pf_schedule(G, T_DETAIL, **params)
-        print("=" * 84)
-        print(f"K={K} UEs x {A} active APs  (L={L}, T={T_DETAIL}, N={N}, seed=2)  --  {label}")
-        print_report(G, result, evaluate(G, result, good_margin_db=MARGIN))
+    snapshots = DynamicScenario(
+        L=L, K=K, semilla=SEED, change_range=CHANGE, churn_share=CHURN, max_move_m=MAX_MOVE_M,
+        channel_Hz=CARRIER_HZ / CAPACITY,
+    ).run(T)
+    result = schedule_assignment(
+        snapshots, CAPACITY, RANGE_M, beta=BETA, prune=PRUNE, repair=REPAIR,
+        compatible=nearest_antennas(NEAREST) if NEAREST else None,
+    )
+    report = evaluate_assignment(result, max_se=MAX_SE)
 
-        ## Comparison of all variants
-        print("-" * 84)
-        print(f"K={K} x {A}: summary")
-        print(f"  {'':24s} {'T':>3s} {'SE/slot':>8s} {'min UE':>8s} {'good cov':>9s} {'worst good':>11s} "
-              f"{'handovers/slot':>15s}  valid")
-        for T in (T_DETAIL, T_LONG):
-            for label, params in variants:
-                r = evaluate(G, pf_schedule(G, T, **params), good_margin_db=MARGIN)
-                print(f"  {label:24s} {T:3d} {r['total_weight']/T:8.3f} {r['min_ue_rate']:8.3f} "
-                      f"{r['good_coverage']:9.0%} {r['min_good_share']:11.0%} "
-                      f"{r['handovers']/max(T-1, 1):15.2f}  {r['valid']}")
-        print()
+    print(f"K={K} users, L={L} antennas, capacity {CAPACITY} ({CARRIER_HZ / CAPACITY / 1e6:g} MHz per user), "
+          f"range {RANGE_M:g} m, T={T}, seed {SEED}")
+    print_report_assignment(result, report)
+
+    print("  Assignment per timeslot (antenna: users; + new user, ~ changed antenna)")
+    for t in range(T):
+        print_assignment(result, t)

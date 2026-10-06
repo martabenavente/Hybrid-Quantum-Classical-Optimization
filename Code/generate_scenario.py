@@ -4,15 +4,9 @@ import numpy as np
 import pandas as pd
 
 
-def get_data(L, K, N, tau_p, ASD_varphi, numActiveAPs, grid, semilla=False, N_max=20,
-             interference_scope="all"):
-
-    # Llamamos a la función para generar los parámetros del entorno
-    gainOverNoisedB, powgain, active_APs, distances, pilotIndex = generateSetup(
-        L=L, K=K, N=N, tau_p=tau_p, ASD_varphi=ASD_varphi, numActiveAPs=numActiveAPs, grid=grid, semilla=semilla
-    )
-    max_gain = np.max(powgain)
-
+def compute_interference(powgain, active_APs, interference_scope="all"):
+    """(L, K) interference at AP l for UE k: power of the other considered UEs."""
+    L, K = powgain.shape
     if interference_scope == "all":
         considered = np.ones((L, K), dtype=bool)
     elif interference_scope == "serving":
@@ -24,7 +18,23 @@ def get_data(L, K, N, tau_p, ASD_varphi, numActiveAPs, grid, semilla=False, N_ma
 
     considered_power = considered * powgain                              # (L, K)
     total_power = considered_power.sum(axis=1, keepdims=True)            # (L, 1)
-    interference_matrix = total_power - powgain * considered             # (L, K), own contribution subtracted
+    return total_power - powgain * considered                            # (L, K), own contribution subtracted
+
+
+def get_data(L, K, N, tau_p, ASD_varphi, numActiveAPs, grid, semilla=False, N_max=20,
+             interference_scope="all", p_mW=100.0):
+
+    # Llamamos a la función para generar los parámetros del entorno
+    gainOverNoisedB, powgain, active_APs, distances, pilotIndex = generateSetup(
+        L=L, K=K, N=N, tau_p=tau_p, ASD_varphi=ASD_varphi, numActiveAPs=numActiveAPs, grid=grid, semilla=semilla
+    )
+    # gainOverNoisedB is channel gain over noise (noise in dBm), without transmit power.
+    # powgain becomes received SNR: p_mW * gain / noise. Interference below inherits it.
+    # gainOverNoisedB stays as is: pilots and contamination tests only compare gains.
+    powgain = p_mW * powgain
+    max_gain = np.max(powgain)
+
+    interference_matrix = compute_interference(powgain, active_APs, interference_scope)
 
     # Inicializar la lista para almacenar los datos
     data = []

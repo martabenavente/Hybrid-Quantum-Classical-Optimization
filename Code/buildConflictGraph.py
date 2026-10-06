@@ -1,133 +1,60 @@
 import itertools
+
 import networkx as nx
 import numpy as np
 
 
-def link_sinr(powgain, interference_matrix, k, l):
-    """SINR of the link AP l -> UE k (linear)."""
-    return float(powgain[l, k] / (1 + interference_matrix[l, k]))
+def antenna_range(range_m, a):
+    """range(a): one value for all antennas, or one per antenna."""
+    return float(range_m[a]) if np.ndim(range_m) else float(range_m)
 
 
-def link_weight(powgain, interference_matrix, k, l):
-    """Spectral efficiency of the link AP l -> UE k: log2(1 + SINR)."""
-    return float(np.log2(1 + link_sinr(powgain, interference_matrix, k, l)))
+def nearest_antennas(m):
+    """compatible(u, a): a is one of the m antennas nearest to u."""
+    def compatible(k, a, scenario):
+        return a in np.argsort(scenario["distances"][:, k])[:m]
+    compatible.__name__ = f"nearest_{m}"
+    return compatible
 
 
-def build_conflict_graph(
-    active_APs,
-    powgain,
-    gainOverNoisedB,
-    pilotIndex,
-    interference_matrix,
-    N=1,                  ## antennas per AP
-    tau_db=3.0,           ## gain margin (dB) for a pilot contamination edge
-    pilot_edges=False,    ## pilot contamination family: off by default, redundant when N=1
-):
+def build_antenna_subgraph(a, unassigned, scenario, range_m, constraints=(), compatible=None):
     """
-    Returns G: graph whose nodes are (UE, AP) links and whose edges connect
-    links that cannot share a timeslot.
+    Returns graph G_a for antenna a.
+      Nodes are unassigned users with dist(u, a) <= range(a) and compatible(u, a).
+      Edges are pairs {u, v} violating at least one constraint, with.
     """
+    D, powgain, uids = scenario["distances"], scenario["powgain"], scenario["uids"]
+    r = antenna_range(range_m, a)
+    V = [k for k in unassigned
+         if D[a, k] <= r and (compatible is None or compatible(k, a, scenario))]
 
-    K = active_APs.shape[0]
+    G = nx.Graph(antenna=a, range_m=r)
+    for k in V:
+        G.add_node(
+            k,
+            uid=int(uids[k]),
+            dist=float(D[a, k]),
+            snr_db=float(10 * np.log10(powgain[a, k])),
+        )
 
-    G = nx.Graph(capacity=N)
-
-    ## Build nodes: one per (UE, AP) link in the UE's active cluster
-    links_by_ap = {}
-    for k in range(K):
-        for l in active_APs[k]:
-            l = int(l)
-            node = (k, l)
-            G.add_node(
-                node,
-                ue=k,
-                ap=l,
-                weight=link_weight(powgain, interference_matrix, k, l),
-                sinr_db=float(10 * np.log10(link_sinr(powgain, interference_matrix, k, l))),
-                pilot=int(pilotIndex[k]),
-            )
-            links_by_ap.setdefault(l, []).append(node)
-
-    def add_conflict(n1, n2, kind):
-        if G.has_edge(n1, n2):
-            G.edges[n1, n2]["kinds"].add(kind)
-        else:
-            G.add_edge(n1, n2, kinds={kind})
-
-    ## Same AP: AP capacity and pilot contamination both live on links that share an AP
-    for l, links in links_by_ap.items():
-        for n1, n2 in itertools.combinations(links, 2):
-            k1, k2 = n1[0], n2[0]
-
-            ## AP capacity (pairwise only valid for N = 1)
-            if N == 1:
-                add_conflict(n1, n2, "ap_capacity")
-
-            ## Pilot contamination: same pilot at the same AP, comparable gain.
-            if pilot_edges and pilotIndex[k1] == pilotIndex[k2]:
-                interference_db = gainOverNoisedB[l, k2] - gainOverNoisedB[l, k1]
-                if interference_db > -tau_db:
-                    add_conflict(n1, n2, "pilot")
+    for u, v in itertools.combinations(V, 2):
+        violated = {name: w_c for name, w_c, check in constraints if check(u, v, a, scenario)}
+        if violated:
+            G.add_edge(u, v, weight=float(sum(violated.values())), kinds=set(violated))
 
     return G
 
 
-def good_links(G, margin_db=3.0):
-    """
-    Good"¡ links: SINR within margin_db of their UE's best link.
-    """
-    best = {}
-    for _, d in G.nodes(data=True):
-        best[d["ue"]] = max(best.get(d["ue"], -np.inf), d["sinr_db"])
-    return {n for n, d in G.nodes(data=True) if d["sinr_db"] >= best[d["ue"]] - margin_db}
-
-
-def ap_load(G):
-    """Number of UEs competing for each AP."""
-    load = {}
-    for _, data in G.nodes(data=True):
-        load[data["ap"]] = load.get(data["ap"], 0) + 1
-    return load
-
-
 if __name__ == "__main__":
 
-    from generate_scenario import get_data
+    from dynamic_scenario import DynamicScenario
 
-    configs = [
-        dict(K=10, numActiveAPs=5),   ## 50 links
-        dict(K=15, numActiveAPs=3),   ## 45 links
-    ]
-    L, T = 30, 3   ## more APs than UEs in both configs
-
-    for cfg in configs:
-        K, A = cfg["K"], cfg["numActiveAPs"]
-
-        active_APs, df_simulation, gainOverNoisedB, powgain, max_gain, pilotIndex, interference_matrix = get_data(
-            L=L, K=K, N=1, tau_p=4, ASD_varphi=10 * (3.14159 / 180), numActiveAPs=A, grid=True, semilla=2
-        )
-
-        G = build_conflict_graph(
-            active_APs, powgain, gainOverNoisedB, pilotIndex, interference_matrix,
-            N=1, tau_db=3.0,
-        )
-
-        load = ap_load(G)
-        shared = {l: n for l, n in load.items() if n > 1}
-
-        print("=" * 70)
-        print(f"K={K} UEs x {A} active APs  (L={L}, T={T})")
-        print(f"  Expected nodes: {K*A}   Actual: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
-        n_pilot = sum("pilot" in d["kinds"] for _, _, d in G.edges(data=True))
-        print(f"  Edges also tagged as pilot contamination: {n_pilot}")
-        print(f"  APs used: {len(load)} of {L}   shared APs: {len(shared)}   "
-              f"max UEs on one AP: {max(load.values())}")
-
-        weights = [d["weight"] for _, d in G.nodes(data=True)]
-        print(f"  Link weights (bits/s/Hz): min={min(weights):.3f}  "
-              f"mean={np.mean(weights):.3f}  max={max(weights):.3f}")
-
-        print("  Links per UE (AP: weight):")
-        for k in range(K):
-            row = ", ".join(f"{l}: {G.nodes[(k, int(l))]['weight']:.2f}" for l in active_APs[k])
-            print(f"    UE {k:2d} (pilot {pilotIndex[k]}): {row}")
+    K, RANGE_M = 60, 200.0
+    s = DynamicScenario(K=K).snapshot()
+    L = s["distances"].shape[0]
+    graphs = {a: build_antenna_subgraph(a, range(K), s, RANGE_M) for a in range(L)}
+    sizes = [G.number_of_nodes() for G in graphs.values()]
+    print(f"K={K} users, L={L} antennas, range {RANGE_M:g} m: users in range per antenna "
+          f"mean {np.mean(sizes):.1f}, max {max(sizes)}")
+    G = graphs[int(np.argmax(sizes))]
+    print(f"  antenna {G.graph['antenna']}: users {sorted(G.nodes)}   edges {G.number_of_edges()}")
