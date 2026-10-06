@@ -1,140 +1,184 @@
 import itertools
 
-from buildConflictGraph import good_links
+import numpy as np
 
 
 # ----------------------------------------------------------------------------------
-# Validation and metrics
+# AssignUsersToAntennas: mapping {t: {uid: antenna}}, one antenna per user
 #
-# Requirements:
-#   - At most T slots are used
-#   - Every UE is served by at least one AP in every slot
-#   - No AP serves more than N UEs in a slot
-#   - No two links in the same slot are joined by a conflict edge
-#   - Every scheduled link is a real (UE, AP) link of the graph
+# Requirements (checked against the snapshot of each timeslot):
+#   - Every mapped uid is present in the timeslot
+#   - Every user is within range(a) of its antenna and compatible with it
+#   - No antenna serves more than capacity(a) users
+#   - No two users of the same antenna are joined by a constraint edge
+# Coverage is a metric, not a requirement: users out of every free antenna wait.
+#
+# Rate of a served user: min(log2(1 + SNR), max_se), no interference (frequencies
+# are assumed not to be reused enough to interfere). max_se is the top of the
+# modulation and coding table: 5.55 bits/s/Hz = uplink 64QAM (LTE/NR CQI 15);
+# 7.41 for 256QAM; None for plain Shannon.
 # ----------------------------------------------------------------------------------
 
 
-def evaluate(G, result, good_margin_db=3.0):
-    T, N = result["T"], result["N"]
-    schedule = result["schedule"]
-    ues = sorted({d["ue"] for _, d in G.nodes(data=True)})
+MAX_SE_REALISTIC = 5.55
+
+
+def evaluate_assignment(result, max_se=MAX_SE_REALISTIC):
+    from buildConflictGraph import antenna_range
+
+    T, snapshots = result["T"], result["snapshots"]
+    capacity, range_m = result["capacity"], result["range_m"]
+    constraints, compatible = result["constraints"], result["compatible"]
     violations = []
+    coverage_per_slot, se_per_slot, uid_rates, dist_served = {}, {}, {}, []
 
-    if result["status"] != "ok":
-        violations.append(f"solver status: {result['status']} ({result['reason']})")
-    if len(schedule) > T:
-        violations.append(f"uses {len(schedule)} slots, more than T={T}")
+    for t in range(T):
+        s, M = snapshots[t], result["mapping"][t]
+        seat = {int(u): k for k, u in enumerate(s["uids"])}
+        D, powgain = s["distances"], s["powgain"]
 
-    weight_per_slot, coverage_per_slot = {}, {}
-    for t, links in schedule.items():
-        for n in links:
-            if n not in G:
-                violations.append(f"slot {t}: {n} is not a link of the graph")
-        links = [n for n in links if n in G]
+        per_antenna = {}
+        for u, a in M.items():
+            if u not in seat:
+                violations.append(f"slot {t}: uid {u} is not in the timeslot")
+                continue
+            k = seat[u]
+            per_antenna.setdefault(a, []).append(k)
+            if D[a, k] > antenna_range(range_m, a):
+                violations.append(f"slot {t}: uid {u} at {D[a, k]:.0f} m of antenna {a}, out of range")
+            if compatible is not None and not compatible(k, a, s):
+                violations.append(f"slot {t}: uid {u} not compatible with antenna {a}")
 
-        ## AP capacity
-        per_ap = {}
-        for k, l in links:
-            per_ap[l] = per_ap.get(l, 0) + 1
-        for l, c in per_ap.items():
-            if c > N:
-                violations.append(f"slot {t}: AP {l} serves {c} UEs (N={N})")
+        for a, ks in per_antenna.items():
+            cap = int(capacity[a]) if np.ndim(capacity) else int(capacity)
+            if len(ks) > cap:
+                violations.append(f"slot {t}: antenna {a} serves {len(ks)} users (capacity {cap})")
+            for u, v in itertools.combinations(ks, 2):
+                for name, _, check in constraints:
+                    if check(u, v, a, s):
+                        violations.append(f"slot {t}: antenna {a} serves uids {s['uids'][u]}, {s['uids'][v]} ({name})")
 
-        ## Conflict edges inside the slot
-        for a, b in itertools.combinations(links, 2):
-            if G.has_edge(a, b):
-                violations.append(f"slot {t}: conflict {a} -- {b} ({sorted(G.edges[a, b]['kinds'])})")
+        ## Rates: served users log2(1 + SNR), unserved 0
+        rates = {}
+        for k, u in enumerate(s["uids"]):
+            u = int(u)
+            a = M.get(u)
+            se = 0.0 if a is None else float(np.log2(1 + powgain[a, k]))
+            rates[u] = se if max_se is None else min(se, max_se)
+            if a is not None:
+                dist_served.append(D[a, k])
+            uid_rates.setdefault(u, []).append(rates[u])
+        coverage_per_slot[t] = len(M) / len(s["uids"])
+        se_per_slot[t] = sum(rates.values())
 
-        ## Coverage
-        served = {k for k, _ in links}
-        missing = [k for k in ues if k not in served]
-        if missing:
-            violations.append(f"slot {t}: UEs not served {missing}")
-        coverage_per_slot[t] = len(served) / len(ues)
-        weight_per_slot[t] = sum(G.nodes[n]["weight"] for n in links)
+    ## Stability: users present in two consecutive slots
+    handovers, lost, kept, arrivals, arrivals_served = 0, 0, 0, 0, 0
+    for t in range(1, T):
+        prev, now = result["mapping"][t - 1], result["mapping"][t]
+        present_before = {int(u) for u in snapshots[t - 1]["uids"]}
+        for u in (int(u) for u in snapshots[t]["uids"]):
+            if u not in present_before:
+                arrivals += 1
+                arrivals_served += u in now
+            elif u in prev and u in now:
+                kept += now[u] == prev[u]
+                handovers += now[u] != prev[u]
+            elif u in prev:
+                lost += 1
 
-    missing_slots = [t for t in range(T) if t not in schedule]
-    if missing_slots:
-        violations.append(f"slots without a schedule: {missing_slots}")
-
-    ## Fairness.
-    ue_rate = {k: {t: 0.0 for t in schedule} for k in ues}
-    for t, links in schedule.items():
-        for n in links:
-            if n in G:
-                ue_rate[n[0]][t] += G.nodes[n]["weight"]
-    ue_mean_rate = {k: (sum(r.values()) / T if T else 0.0) for k, r in ue_rate.items()}
-    x = list(ue_mean_rate.values())
+    mean_rate = {u: float(np.mean(r)) for u, r in uid_rates.items()}
+    x = list(mean_rate.values())
     jain = (sum(x) ** 2) / (len(x) * sum(v * v for v in x)) if x and any(x) else 0.0
-
-    ## AP handovers: an AP that serves a different UE than in the previous slot
-    handovers = 0
-    slots = sorted(schedule)
-    for t_prev, t in zip(slots, slots[1:]):
-        prev = {l: k for k, l in schedule[t_prev]}
-        for k, l in schedule[t]:
-            if l in prev and prev[l] != k:
-                handovers += 1
-
-    ## Good link coverage per UE: share of the T slots with >= 1 good link
-    good = good_links(G, good_margin_db)
-    ue_good_slots = {k: [] for k in ues}
-    for t in slots:
-        with_good = {n[0] for n in schedule[t] if n in good}
-        for k in ues:
-            if k in with_good:
-                ue_good_slots[k].append(t)
-    ue_good_share = {k: (len(s) / T if T else 0.0) for k, s in ue_good_slots.items()}
+    mhz = snapshots[0].get("channel_Hz", 0.0) / 1e6
+    loads = [len([u for u, a in result["mapping"][t].items() if a == b])
+             for t in range(T) for b in set(result["mapping"][t].values())]
 
     return {
         "valid": not violations,
         "violations": violations,
-        "total_weight": sum(weight_per_slot.values()),
-        "weight_per_slot": weight_per_slot,
+        "total_weight": sum(se_per_slot.values()),
+        "se_per_slot": se_per_slot,
         "coverage_per_slot": coverage_per_slot,
-        "coverage_rate": (sum(coverage_per_slot.values()) / T) if T else 0.0,
-        "slots_used": len(schedule),
-        "links_used": len({n for links in schedule.values() for n in links}),
-        "ue_rate": ue_rate,
-        "ue_mean_rate": ue_mean_rate,
+        "coverage_rate": float(np.mean(list(coverage_per_slot.values()))),
+        "unserved": result["unserved"],
+        "n_ues": len(mean_rate),
+        "uid_mean_rate": mean_rate,
         "min_ue_rate": min(x) if x else 0.0,
+        "p10_ue_rate": float(np.percentile(x, 10)) if x else 0.0,
+        "median_ue_rate": float(np.median(x)) if x else 0.0,
         "jain_index": jain,
-        "handovers": handovers,
-        "good_margin_db": good_margin_db,
-        "ue_good_slots": ue_good_slots,
-        "ue_good_share": ue_good_share,
-        "good_coverage": (sum(ue_good_share.values()) / len(ues)) if ues else 0.0,
-        "min_good_share": min(ue_good_share.values()) if ues else 0.0,
-        "ues_never_good": [k for k, s in ue_good_share.items() if s == 0],
+        "channel_MHz": mhz,
+        "max_se": max_se,
+        "median_mbps": float(np.median(x)) * mhz if x else 0.0,
+        "p10_mbps": float(np.percentile(x, 10)) * mhz if x else 0.0,
+        "mean_dist_m": float(np.mean(dist_served)) if dist_served else 0.0,
+        "antennas_used": float(np.mean([len(set(result["mapping"][t].values())) for t in range(T)])),
+        "mean_load": float(np.mean(loads)) if loads else 0.0,
+        "handovers": handovers,   ## served in both slots, by a different antenna
+        "kept": kept,             ## served in both slots, by the same antenna
+        "lost": lost,             ## served before, unserved now
+        "arrivals": arrivals,
+        "arrivals_served": arrivals_served,
+        "status_counts": {st: list(result.get("status", {}).values()).count(st)
+                          for st in sorted(set(result.get("status", {}).values()))},
+        "repair_moved": sum(i.get("moved", 0) for i in result.get("info", {}).values()),
+        "repair_added": sum(i.get("added", 0) for i in result.get("info", {}).values()),
         "runtime_s": result["runtime_s"],
     }
 
 
-def print_report(G, result, report):
-    print(f"  Valid: {report['valid']}   status: {result['status']}")
+def print_report_assignment(result, report):
+    T = result["T"]
+    print(f"  Valid: {report['valid']}")
     for v in report["violations"]:
         print(f"    ! {v}")
-    print(f"  Total SE: {report['total_weight']:.3f} bits/s/Hz   "
-          f"coverage: {report['coverage_rate']:.0%}   slots used: {report['slots_used']}/{result['T']}   "
-          f"links used: {report['links_used']}/{G.number_of_nodes()}   "
-          f"runtime: {report['runtime_s']*1e3:.1f} ms")
-    print(f"  Fairness: min UE mean rate {report['min_ue_rate']:.3f}   "
-          f"Jain index {report['jain_index']:.3f}   AP handovers {report['handovers']}")
-    print(f"  Good-link coverage ({report['good_margin_db']:g} dB): {report['good_coverage']:.0%} of UE-slots   "
-          f"worst UE {report['min_good_share']:.0%}   UEs never on a good link: {report['ues_never_good'] or 'none'}")
+    changed = [len(s["arrived"]) + len(s["moved"]) for s in result["snapshots"][1:]]
+    if changed and any(changed):
+        K = len(result["snapshots"][0]["uids"])
+        print(f"  Scenario: {report['n_ues']} different users over {T} timeslots, "
+              f"{np.mean(changed) / K:.0%} changed per timeslot on average")
+    print(f"  SE: {report['total_weight'] / T:.2f} bits/s/Hz per slot   coverage {report['coverage_rate']:.0%}   "
+          f"runtime {report['runtime_s'] * 1e3:.1f} ms")
+    print(f"  Slots: " + ", ".join(f"{n} {st}" for st, n in report["status_counts"].items())
+          + f"   repair: {report['repair_added']} users added, {report['repair_moved']} moved")
+    print(f"  User mean rate (bits/s/Hz): min {report['min_ue_rate']:.3f}   worst 10% {report['p10_ue_rate']:.3f}   "
+          f"median {report['median_ue_rate']:.3f}   Jain {report['jain_index']:.3f}")
+    if report["channel_MHz"]:
+        cap = "Shannon" if report["max_se"] is None else f"SE capped at {report['max_se']:g} bits/s/Hz"
+        print(f"  Throughput ({report['channel_MHz']:g} MHz per user, {cap}): worst 10% {report['p10_mbps']:.1f} Mbps   "
+              f"median {report['median_mbps']:.1f} Mbps")
+    print(f"  Antennas: {report['antennas_used']:.1f} used per slot, {report['mean_load']:.2f} users each   "
+          f"mean distance to serving antenna {report['mean_dist_m']:.0f} m")
+    stay = report["kept"] + report["handovers"]
+    if stay:
+        print(f"  Staying users: kept antenna {report['kept']}, handover {report['handovers']} "
+              f"({report['handovers'] / stay:.0%}), lost service {report['lost']}")
+    if report["arrivals"]:
+        print(f"  New users served in their first timeslot: {report['arrivals_served']}/{report['arrivals']}")
+    for t, us in report["unserved"].items():
+        if us:
+            print(f"    slot {t}: unserved uids {us}")
 
-    ues = sorted({d["ue"] for _, d in G.nodes(data=True)})
-    slots = sorted(result["schedule"])
-    good = good_links(G, report["good_margin_db"])
-    print("  Schedule: APs serving each UE (UE rate in that slot), * = good link")
-    print("    UE  | " + " | ".join(f"slot {t:<17}" for t in slots) + " | mean rate | good slots")
-    for k in ues:
-        cells = []
-        for t in slots:
-            aps = [f"{l}*" if (kk, l) in good else f"{l}" for (kk, l) in result["schedule"][t] if kk == k]
-            cell = f"{','.join(aps) or '-'} ({report['ue_rate'][k][t]:.2f})"
-            cells.append(f"{cell:<22}")
-        print(f"    {k:3d} | " + " | ".join(cells)
-              + f" | {report['ue_mean_rate'][k]:9.3f} | {report['ue_good_share'][k]:.0%}")
-    print("    SE  | " + " | ".join(f"{report['weight_per_slot'][t]:<22.3f}" for t in slots))
+
+def print_assignment(result, t):
+    """Antenna -> users of timeslot t. Marks: + new user, ~ changed antenna since t-1."""
+    M = result["mapping"][t]
+    prev = result["mapping"].get(t - 1, {})
+    present_before = {int(u) for u in result["snapshots"][t - 1]["uids"]} if t > 0 else set()
+
+    def mark(u):
+        if t > 0 and u not in present_before:
+            return f"{u}+"
+        if u in prev and prev[u] != M[u]:
+            return f"{u}~"
+        return str(u)
+
+    by_antenna = {}
+    for u, a in sorted(M.items()):
+        by_antenna.setdefault(a, []).append(mark(u))
+    status = result.get("status", {}).get(t, "")
+    print(f"  Slot {t}: {len(M)} users on {len(by_antenna)} antennas   ({status})")
+    for a in sorted(by_antenna):
+        print(f"    antenna {a:2d}: {', '.join(by_antenna[a])}")
+    if result["unserved"][t]:
+        print(f"    unserved: {', '.join(map(str, result['unserved'][t]))}")

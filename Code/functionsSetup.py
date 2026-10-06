@@ -4,27 +4,32 @@ import sympy as sp
 import scipy.linalg as spalg
 import matplotlib.pyplot as plt
 
-def generateSetup(L, K, N, tau_p, ASD_varphi, numActiveAPs, grid=True, semilla=False):
+# Simulation Setup Configuration Parameters (module level so that
+# dynamic_scenario.py can reuse them for UEs that move or arrive)
+squarelength = 1000         # length of one side the coverage area in m (assuming wrap-around)
+
+B = 20*10**6                # communication bandwidth in Hz
+noiseFigure = 7             # noise figure in dB
+noiseVariancedBm = -174+10*np.log10(B) + noiseFigure        #noise power in dBm
+
+alpha = 36.7                # pathloss parameters for the path loss model
+constantTerm = -30.5
+
+sigma_sf = 4                # standard deviation of the shadow fading
+decorr = 9                  # decorrelatiojn distance of the shadow fading
+
+distanceVertical = 10       # height difference between the APs and the UEs in meters
+antennaSpacing = 0.5        # half-wavelength distance
+
+
+def generateSetup(L, K, N, tau_p, ASD_varphi, numActiveAPs, grid=True, semilla=False, return_state=False):
+    # return_state=True also returns (APpositions, UEpositions, shadowAPrealizations),
+    # the state dynamic_scenario.py needs to move UEs or replace them.
 
 
     if semilla:
         np.random.seed(semilla)
 
-    # Simulation Setup Configuration Parameters
-    squarelength = 1000         # length of one side the coverage area in m (assuming wrap-around)
-
-    B = 20*10**6                # communication bandwidth in Hz
-    noiseFigure = 7             # noise figure in dB
-    noiseVariancedBm = -174+10*np.log10(B) + noiseFigure        #noise power in dBm
-
-    alpha = 36.7                # pathloss parameters for the path loss model
-    constantTerm = -30.5
-
-    sigma_sf = 4                # standard deviation of the shadow fading
-    decorr = 9                  # decorrelatiojn distance of the shadow fading
-
-    distanceVertical = 10       # height difference between the APs and the UEs in meters
-    antennaSpacing = 0.5        # half-wavelength distance
 
     # To save the results
     gainOverNoisedB = np.zeros((L, K))
@@ -187,6 +192,9 @@ def generateSetup(L, K, N, tau_p, ASD_varphi, numActiveAPs, grid=True, semilla=F
     # downstream to build pilot-contamination edges in the conflict graph.
     pilotIndex = pilotIndex.astype(int)
 
+    if return_state:
+        return (gainOverNoisedB, powgain, active_APs, distances, pilotIndex,
+                APpositions, UEpositions, shadowAPrealizations)
     return gainOverNoisedB, powgain, active_APs, distances, pilotIndex # APpositions, UEpositions
 
 
