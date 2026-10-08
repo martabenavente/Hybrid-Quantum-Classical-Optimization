@@ -13,17 +13,25 @@ import numpy as np
 #   - No two users of the same antenna are joined by a constraint edge
 # Coverage is a metric, not a requirement: users out of every free antenna wait.
 #
-# Rate of a served user: min(log2(1 + SNR), max_se), no interference (frequencies
-# are assumed not to be reused enough to interfere). max_se is the top of the
-# modulation and coding table: 5.55 bits/s/Hz = uplink 64QAM (LTE/NR CQI 15);
-# 7.41 for 256QAM; None for plain Shannon.
+# Rate of a served user: min(log2(1 + SINR), max_se). No interference between
+# antennas (frequencies are assumed not to be reused enough to interfere). Within
+# an antenna, every other user leaks into a user's channel: with probability
+# p_adjacent it is on an adjacent channel (leakage_db below its received power,
+# 3GPP UE ACLR: 30 dB), otherwise further away (far_db, 43 dB); the expected
+# leakage is used. p_adjacent = 2 / capacity for random channels (None: that);
+# 1 = all adjacent (worst case). leakage_db None: no leakage.
+# max_se is the top of the modulation and coding table: 5.55 bits/s/Hz = uplink
+# 64QAM (LTE/NR CQI 15); 7.41 for 256QAM; None for plain Shannon.
 # ----------------------------------------------------------------------------------
 
 
 MAX_SE_REALISTIC = 5.55
+LEAKAGE_DB_REALISTIC = 30.0
+FAR_DB_REALISTIC = 43.0
 
 
-def evaluate_assignment(result, max_se=MAX_SE_REALISTIC):
+def evaluate_assignment(result, max_se=MAX_SE_REALISTIC, leakage_db=LEAKAGE_DB_REALISTIC, p_adjacent=None,
+                        far_db=FAR_DB_REALISTIC):
     from buildConflictGraph import antenna_range
 
     T, snapshots = result["T"], result["snapshots"]
@@ -31,6 +39,9 @@ def evaluate_assignment(result, max_se=MAX_SE_REALISTIC):
     constraints, compatible = result["constraints"], result["compatible"]
     violations = []
     coverage_per_slot, se_per_slot, uid_rates, dist_served = {}, {}, {}, []
+    soft_penalty, soft_pairs = {}, {}       ## per slot: sum of w_c * strength, pairs with a soft cost
+    leak_loss = []                          ## per served user: capped SE lost to leakage
+    p_adj = (min(1.0, 2.0 / float(np.mean(capacity))) if p_adjacent is None else p_adjacent)
 
     for t in range(T):
         s, M = snapshots[t], result["mapping"][t]
@@ -54,18 +65,27 @@ def evaluate_assignment(result, max_se=MAX_SE_REALISTIC):
             if len(ks) > cap:
                 violations.append(f"slot {t}: antenna {a} serves {len(ks)} users (capacity {cap})")
             for u, v in itertools.combinations(ks, 2):
-                for name, _, check in constraints:
-                    if check(u, v, a, s):
+                for name, w_c, strength, hard in constraints:
+                    st = strength(u, v, a, s)
+                    if st > 0 and hard:
                         violations.append(f"slot {t}: antenna {a} serves uids {s['uids'][u]}, {s['uids'][v]} ({name})")
+                    elif st > 0:
+                        soft_penalty[t] = soft_penalty.get(t, 0.0) + w_c * st
+                        soft_pairs[t] = soft_pairs.get(t, 0) + 1
 
-        ## Rates: served users log2(1 + SNR), unserved 0
+        ## Rates: served users log2(1 + SINR), leakage from the other users of their antenna; unserved 0
+        g = 0.0 if leakage_db is None else p_adj * 10 ** (-leakage_db / 10) + (1 - p_adj) * 10 ** (-far_db / 10)
+        cap = (lambda x: x) if max_se is None else (lambda x: min(x, max_se))
         rates = {}
         for k, u in enumerate(s["uids"]):
             u = int(u)
             a = M.get(u)
-            se = 0.0 if a is None else float(np.log2(1 + powgain[a, k]))
-            rates[u] = se if max_se is None else min(se, max_se)
-            if a is not None:
+            if a is None:
+                rates[u] = 0.0
+            else:
+                leak = g * sum(powgain[a, v] for v in per_antenna[a] if v != k)
+                rates[u] = cap(float(np.log2(1 + powgain[a, k] / (1 + leak))))
+                leak_loss.append(cap(float(np.log2(1 + powgain[a, k]))) - rates[u])
                 dist_served.append(D[a, k])
             uid_rates.setdefault(u, []).append(rates[u])
         coverage_per_slot[t] = len(M) / len(s["uids"])
@@ -114,6 +134,13 @@ def evaluate_assignment(result, max_se=MAX_SE_REALISTIC):
         "mean_dist_m": float(np.mean(dist_served)) if dist_served else 0.0,
         "antennas_used": float(np.mean([len(set(result["mapping"][t].values())) for t in range(T)])),
         "mean_load": float(np.mean(loads)) if loads else 0.0,
+        "leakage_db": leakage_db,
+        "p_adjacent": p_adj,
+        "leak_hit_share": float(np.mean([x > 0.01 for x in leak_loss])) if leak_loss else 0.0,
+        "leak_loss_mean": float(np.mean(leak_loss)) if leak_loss else 0.0,
+        "leak_loss_p90": float(np.percentile(leak_loss, 90)) if leak_loss else 0.0,
+        "soft_penalty": sum(soft_penalty.values()) / T,   ## per slot
+        "soft_pairs": sum(soft_pairs.values()) / T,       ## per slot
         "handovers": handovers,   ## served in both slots, by a different antenna
         "kept": kept,             ## served in both slots, by the same antenna
         "lost": lost,             ## served before, unserved now
@@ -139,6 +166,12 @@ def print_report_assignment(result, report):
               f"{np.mean(changed) / K:.0%} changed per timeslot on average")
     print(f"  SE: {report['total_weight'] / T:.2f} bits/s/Hz per slot   coverage {report['coverage_rate']:.0%}   "
           f"runtime {report['runtime_s'] * 1e3:.1f} ms")
+    sizes = [s[1] for i in result["info"].values() for s in i["antennas"].values()]
+    if sizes:
+        capped = sum(s[0] > s[1] for i in result["info"].values() for s in i["antennas"].values())
+        print(f"  Oracle problems: {len(sizes)}, users per problem mean {np.mean(sizes):.1f}, "
+              f"90% {np.percentile(sizes, 90):.0f}, max {max(sizes)}"
+              + (f"   ({capped} capped at {result['max_candidates']})" if result.get("max_candidates") else ""))
     print(f"  Slots: " + ", ".join(f"{n} {st}" for st, n in report["status_counts"].items())
           + f"   repair: {report['repair_added']} users added, {report['repair_moved']} moved")
     print(f"  User mean rate (bits/s/Hz): min {report['min_ue_rate']:.3f}   worst 10% {report['p10_ue_rate']:.3f}   "
@@ -149,6 +182,14 @@ def print_report_assignment(result, report):
               f"median {report['median_mbps']:.1f} Mbps")
     print(f"  Antennas: {report['antennas_used']:.1f} used per slot, {report['mean_load']:.2f} users each   "
           f"mean distance to serving antenna {report['mean_dist_m']:.0f} m")
+    if report["leakage_db"] is not None:
+        print(f"  Leakage ({report['leakage_db']:g} dB adjacent with p = {report['p_adjacent']:.2f}, else 43 dB): "
+              f"{report['leak_hit_share']:.0%} of "
+              f"served users lose rate, mean loss {report['leak_loss_mean']:.2f}, "
+              f"worst 10% lose {report['leak_loss_p90']:.2f} bits/s/Hz")
+    if any(not c[3] for c in result["constraints"]):
+        print(f"  Soft constraints: {report['soft_pairs']:.1f} pairs per slot share an antenna with a cost, "
+              f"total {report['soft_penalty']:.2f} per slot")
     stay = report["kept"] + report["handovers"]
     if stay:
         print(f"  Staying users: kept antenna {report['kept']}, handover {report['handovers']} "
