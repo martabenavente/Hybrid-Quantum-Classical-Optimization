@@ -1,210 +1,297 @@
 import itertools
-import numpy as np
+import json
+import os
+
 import networkx as nx
+import numpy as np
 
 
-def build_primary_graph(G):
-    """Conflict graph edges + same UE ("primary") edges, on the same link nodes."""
-
-    if G.graph.get("capacity", 1) != 1:
-        raise NotImplementedError("Option C is formulated for N = 1 (antenna copies needed for N > 1).")
-    H = nx.Graph(capacity=1)
-    H.add_nodes_from(G.nodes(data=True))
-    for a, b, d in G.edges(data=True):
-        H.add_edge(a, b, kinds=set(d["kinds"]))
-    links_by_ue = {}
-    for n, d in G.nodes(data=True):
-        links_by_ue.setdefault(d["ue"], []).append(n)
-    for links in links_by_ue.values():
-        for a, b in itertools.combinations(sorted(links), 2):
-            if H.has_edge(a, b):
-                H.edges[a, b]["kinds"].add("primary")
-            else:
-                H.add_edge(a, b, kinds={"primary"})
-    return H
+def slack_coefficients(C):
+    """Bounded binary encoding of 0..C: 1, 2, 4, ..., remainder."""
+    coeffs, total, p = [], 0, 1
+    while total + p <= C:
+        coeffs.append(p)
+        total += p
+        p *= 2
+    if total < C:
+        coeffs.append(C - total)
+    return coeffs
 
 
-def build_qubo(G, weights=None, bonus_margin=1.0, alpha_margin=1.0):
+def build_antenna_qubo(G, weights, capacity=None, penalty_factor=1.5):
     """
-    Build the QUBO of one slot.
-
-    G: conflict graph from build_conflict_graph (N = 1)
-    weights  {link: weight} for this slot (default: link SE)
-    Returns a dict with:
-      variables: list of links, qubit i <-> variables[i]
-      Q: (n x n) upper triangular matrix, E(x) = x^T Q x
-      H: primary link graph
-      w_norm, w_prime, W, alpha: the coefficients, for inspection
+    QUBO of antenna graph G with node weights {u: w_u}.
+    
+    Returns dict: Q (symmetric), offset, users (variable i <-> users[i] for
+    i < n_users, then slack bits), n_users, slack, P, lam.
     """
-    H = build_primary_graph(G)
-    variables = sorted(H.nodes)
-    index = {n: i for i, n in enumerate(variables)}
-    n_ues = len({d["ue"] for _, d in H.nodes(data=True)})
+    users = sorted(G.nodes)
+    n = len(users)
+    idx = {u: i for i, u in enumerate(users)}
+    w_max = max(weights.values()) if weights else 1.0
+    P = lam = penalty_factor * w_max
 
-    if weights is None:
-        weights = {n: H.nodes[n]["weight"] for n in variables}
-    w = np.array([weights[n] for n in variables], dtype=float)
-    w_norm = w / w.max() if w.max() > 0 else w
+    use_capacity = capacity is not None and n > capacity
+    slack = slack_coefficients(int(capacity)) if use_capacity else []
+    N = n + len(slack)
+    Q = np.zeros((N, N))
+    offset = 0.0
 
-    top = np.sort(w_norm)[::-1][: max(n_ues - 1, 0)]
-    W = float(top.sum()) + bonus_margin
-    w_prime = w_norm + W
+    for u in users:
+        Q[idx[u], idx[u]] -= weights[u]
+    for u, v, d in G.edges(data=True):
+        c = P if d["hard"] else d["weight"]
+        Q[idx[u], idx[v]] += c / 2
+        Q[idx[v], idx[u]] += c / 2
 
-    Q = np.zeros((len(variables), len(variables)))
-    Q[np.diag_indices_from(Q)] = -w_prime
-    alpha = {}
-    for a, b in H.edges:
-        i, j = sorted((index[a], index[b]))
-        alpha[(a, b)] = max(w_prime[i], w_prime[j]) + alpha_margin
-        Q[i, j] = alpha[(a, b)]
+    if use_capacity:
+        a = np.array([1.0] * n + [float(c) for c in slack])
+        C = float(capacity)
+        Q += lam * np.outer(a, a) - np.diag(2 * lam * C * a)
+        offset += lam * C ** 2
 
-    return {
-        "variables": variables,
-        "index": index,
-        "Q": Q,
-        "H": H,
-        "w_norm": dict(zip(variables, w_norm)),
-        "w_prime": dict(zip(variables, w_prime)),
-        "W": W,
-        "alpha": alpha,
-        "bonus_margin": bonus_margin,
-        "alpha_margin": alpha_margin,
-    }
+    return {"Q": Q, "offset": offset, "users": users, "n_users": n, "slack": slack, "P": P, "lam": lam}
 
 
 def energy(qubo, x):
-    """E(x) = x^T Q x for a 0/1 vector (or a matrix of them, one per row)."""
+    """E(x) = x^T Q x + offset, for one 0/1 vector or one per row."""
     x = np.asarray(x, dtype=float)
-    Q = qubo["Q"]
     if x.ndim == 1:
-        return float(x @ Q @ x)
-    return np.einsum("si,ij,sj->s", x, Q, x)
-
-
-def encode(qubo, links):
-    x = np.zeros(len(qubo["variables"]))
-    for n in links:
-        x[qubo["index"][n]] = 1
-    return x
+        return float(x @ qubo["Q"] @ x) + qubo["offset"]
+    return np.einsum("si,ij,sj->s", x, qubo["Q"], x) + qubo["offset"]
 
 
 def decode(qubo, x):
-    return [n for n, xi in zip(qubo["variables"], x) if xi > 0.5]
+    """Users with x_u = 1 (slack bits dropped)."""
+    return [u for u, xi in zip(qubo["users"], x[: qubo["n_users"]]) if xi > 0.5]
 
 
-def qubo_to_dict(qubo):
-    """{(i, j): coefficient}, the usual input format for QUBO samplers."""
-    Q = qubo["Q"]
-    return {(i, j): float(Q[i, j]) for i, j in zip(*np.nonzero(Q))}
+def antenna_objective(G, weights, S):
+    """sum w - sum soft J over the users S; -inf if S contains a hard pair."""
+    value = sum(weights[u] for u in S)
+    for u, v in itertools.combinations(S, 2):
+        if G.has_edge(u, v):
+            if G.edges[u, v]["hard"]:
+                return -np.inf
+            value -= G.edges[u, v]["weight"]
+    return value
 
 
-def complete_slot(G, primary_links, weights=None):
-    """
-    Classical step after the sampler: keep the primary links and give every AP
-    they leave idle to its best remaining link.
-    """
-    if weights is None:
-        weights = {n: G.nodes[n]["weight"] for n in G.nodes}
-    chosen = set(primary_links)
-    blocked = set().union(*(set(G.neighbors(n)) for n in chosen)) if chosen else set()
-    for n in sorted(G.nodes, key=lambda n: (-weights[n], n)):
-        if n not in chosen and n not in blocked:
-            chosen.add(n)
-            blocked |= set(G.neighbors(n))
-    return sorted(chosen)
+def exact_antenna(G, weights, capacity):
+    """Exact optimum by enumerating every set of <= capacity users. Returns (value, users)."""
+    best, best_S = 0.0, []
+    for r in range(1, min(capacity, G.number_of_nodes()) + 1):
+        for S in itertools.combinations(sorted(G.nodes), r):
+            v = antenna_objective(G, weights, S)
+            if v > best + 1e-12:
+                best, best_S = v, list(S)
+    return best, best_S
 
 
-def summary(qubo):
-    H, Q = qubo["H"], qubo["Q"]
-    kinds = {}
-    for *_, d in H.edges(data=True):
-        for k in d["kinds"]:
-            kinds[k] = kinds.get(k, 0) + 1
-    n = len(qubo["variables"])
-    coeffs = np.abs(Q[np.nonzero(Q)])
-    w = np.array(list(qubo["w_norm"].values()))
+def qubo_summary(qubo):
+    """Size and coefficients of a QUBO: variables, couplings, density, coefficient range."""
+    Q, N = qubo["Q"], qubo["Q"].shape[0]
+    off = Q[np.triu_indices(N, 1)]
+    coupled = off[off != 0]
+    coeffs = np.abs(np.concatenate([np.diag(Q), off]))
+    coeffs = coeffs[coeffs > 0]
     return {
-        "qubits": n,
-        "quadratic_terms": H.number_of_edges(),
-        "density": H.number_of_edges() / (n * (n - 1) / 2) if n > 1 else 0.0,
-        "edges_by_kind": kinds,
-        "W": qubo["W"],
-        "coeff_range": (float(coeffs.min()), float(coeffs.max())),
-        "smallest_weight_gap": float(np.min(np.diff(np.unique(w)))) if len(np.unique(w)) > 1 else 0.0,
+        "variables": N,
+        "users": qubo["n_users"],
+        "slack": len(qubo["slack"]),
+        "couplings": int(coupled.size),
+        "density": coupled.size / (N * (N - 1) / 2) if N > 1 else 0.0,
+        "off_diagonal_nonnegative": bool((off >= 0).all()),
+        "coeff_min": float(coeffs.min()) if coeffs.size else 0.0,
+        "coeff_max": float(coeffs.max()) if coeffs.size else 0.0,
     }
+
+
+def qubo_formula(qubo):
+    """E(x) written out with the numbers of the QUBO (x_i users, s_j slack bits)."""
+    Q, N, n = qubo["Q"], qubo["Q"].shape[0], qubo["n_users"]
+    names = [f"x{i}" for i in range(n)] + [f"s{j}" for j in range(N - n)]
+    terms = [f"{Q[i, i]:+.3f}*{names[i]}" for i in range(N) if Q[i, i] != 0]
+    terms += [f"{2 * Q[i, j]:+.3f}*{names[i]}*{names[j]}"
+              for i in range(N) for j in range(i + 1, N) if Q[i, j] != 0]
+    if qubo["offset"]:
+        terms.append(f"{qubo['offset']:+.3f}")
+    return "E(x) = " + " ".join(terms) if terms else "E(x) = 0"
+
+
+def print_qubo(G, weights, qubo, title=""):
+    """The QUBO of one antenna step by step: users and weights, edges, formula, matrix."""
+    n, users = qubo["n_users"], qubo["users"]
+    N = qubo["Q"].shape[0]
+    idx = {u: i for i, u in enumerate(users)}
+    print(f"  {title}")
+    print("    Variables: x_i = 1 if the antenna serves user i"
+          + (f"; slack bits s_j with coefficients {qubo['slack']}" if qubo["slack"] else ""))
+    print(f"    {'var':>4s} {'uid':>5s} {'dist m':>7s} {'SE':>6s} {'w_u':>7s}")
+    for i, u in enumerate(users):
+        d = G.nodes[u]
+        print(f"    {'x' + str(i):>4s} {d['uid']:5d} {d['dist']:7.0f} {d['se']:6.2f} {weights[u]:7.3f}")
+    cap_txt = f", capacity penalty lambda = {qubo['lam']:.3f}" if qubo["slack"] else ", capacity not in the QUBO"
+    print(f"    Edges ({G.number_of_edges()}): hard penalty P = {qubo['P']:.3f}{cap_txt}")
+    for u, v, d in sorted(G.edges(data=True), key=lambda e: (idx[e[0]], idx[e[1]])):
+        cost = f"hard (P = {qubo['P']:.3f})" if d["hard"] else f"soft J = {d['weight']:.3f}"
+        print(f"      x{idx[u]}-x{idx[v]}: {cost:22s} {sorted(d['kinds'])}")
+    print(f"    {qubo_formula(qubo)}")
+    names = [f"x{i}" for i in range(n)] + [f"s{j}" for j in range(N - n)]
+    print(f"    Q (symmetric, E = x^T Q x + offset, offset = {qubo['offset']:.3f}):")
+    print("    " + " " * 5 + "".join(f"{c:>8s}" for c in names))
+    for i in range(N):
+        row = "".join(f"{qubo['Q'][i, j]:8.3f}" if qubo["Q"][i, j] else f"{'.':>8s}" for j in range(N))
+        print(f"    {names[i]:>5s}{row}")
+
+def problem_record(t, G, weights, capacity, qubo, reference=None):
+    """JSON-ready record of one antenna problem: graph, weights, capacity, QUBO, references."""
+    users = qubo["users"]
+    return {
+        "slot": t,
+        "antenna": int(G.graph["antenna"]),
+        "capacity": int(capacity),
+        "users": [int(u) for u in users],
+        "uids": [int(G.nodes[u]["uid"]) for u in users],
+        "dist": [G.nodes[u]["dist"] for u in users],
+        "se": [G.nodes[u]["se"] for u in users],
+        "weights": [float(weights[u]) for u in users],
+        "edges": [[int(u), int(v), float(d["weight"]), bool(d["hard"]), sorted(d["kinds"])]
+                  for u, v, d in G.edges(data=True)],
+        "Q": qubo["Q"].tolist(),
+        "offset": qubo["offset"],
+        "n_users": qubo["n_users"],
+        "slack": qubo["slack"],
+        "P": qubo["P"],
+        "lam": qubo["lam"],
+        "summary": qubo_summary(qubo),
+        "reference": reference or {},
+    }
+
+
+def save_qubos(path, params, records):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"params": params, "problems": records}, f)
+
+
+def load_qubos(path):
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def problem_graph(rec):
+    """(G, weights, capacity) of a saved problem, as the oracles get them."""
+    G = nx.Graph(antenna=rec["antenna"])
+    for u, uid, d, se in zip(rec["users"], rec["uids"], rec["dist"], rec["se"]):
+        G.add_node(u, uid=uid, dist=d, se=se)
+    for u, v, wt, hard, kinds in rec["edges"]:
+        G.add_edge(u, v, weight=wt, hard=hard, kinds=set(kinds))
+    return G, dict(zip(rec["users"], rec["weights"])), rec["capacity"]
+
+
+def problem_qubo(rec):
+    """The saved QUBO, in the form of build_antenna_qubo (for energy / decode)."""
+    return {"Q": np.array(rec["Q"]), "offset": rec["offset"], "users": rec["users"],
+            "n_users": rec["n_users"], "slack": rec["slack"], "P": rec["P"], "lam": rec["lam"]}
 
 
 if __name__ == "__main__":
 
-    from generate_scenario import get_data
-    from buildConflictGraph import build_conflict_graph
-    from greedySolver import pf_schedule
+    from dynamic_scenario import DynamicScenario, CARRIER_HZ
+    from buildConflictGraph import min_separation, leakage, best_antennas, adjacent_probability
+    from greedySolver import greedy_oracle, assign_users_to_antennas
 
-    L, N = 30, 1
+    ## Same setup as the pipeline
+    K, L, T, SEED = 120, 30, 10, 2
+    CAPACITY, RANGE_M, BEST_APS, MAX_QUBO_USERS = 6, 300.0, 3, 25
+    ALPHA_QUALITY, ALPHA_CONTINUITY, MAX_SE = 1.0, 0.5, 5.55
+    MIN_SEP_M, ALPHA_LEAK, LEAKAGE_DB = 25.0, 2.0, 30.0
+    P_ADJACENT = adjacent_probability(CAPACITY)   ## two users of an antenna on adjacent channels
+    CAPACITY_IN_QUBO = False          ## False: capacity left to the prune step
+    PENALTY_FACTOR = 1.5
+    EXAMPLE = None                    ## (slot, antenna) to show in full, None: the largest QUBO
+    OUT = os.path.join("results", f"qubos_K{K}_C{CAPACITY}_seed{SEED}.json")
 
-    for K, A, cluster in [(10, 5, [1, 2, 8]), (15, 3, [3, 11, 12, 14])]:
-        active_APs, _, gainOverNoisedB, powgain, _, pilotIndex, interference_matrix = get_data(
-            L=L, K=K, N=N, tau_p=4, ASD_varphi=10 * (3.14159 / 180), numActiveAPs=A, grid=True, semilla=2
-        )
-        G = build_conflict_graph(active_APs, powgain, gainOverNoisedB, pilotIndex,
-                                 interference_matrix, N=N)
+    ## 1. The per-antenna problems of a run (each oracle call: graph, weights, capacity)
+    constraints = [min_separation(MIN_SEP_M), leakage(ALPHA_LEAK, LEAKAGE_DB, MAX_SE, p_adjacent=P_ADJACENT)]
+    snapshots = DynamicScenario(L=L, K=K, semilla=SEED, channel_Hz=CARRIER_HZ / CAPACITY).run(T)
+    problems, current = [], {}
 
-        ## Slot 0 of the PF scheduler: PF weights = SE / eps
-        qubo = build_qubo(G)
-        s = summary(qubo)
-        print("=" * 84)
-        print(f"K={K} UEs x {A} active APs  (L={L}, N={N}, seed=2)  --  QUBO of slot 0")
-        print(f"  Qubits: {s['qubits']}   quadratic terms: {s['quadratic_terms']}   density: {s['density']:.1%}")
-        print(f"  Edges by kind: {s['edges_by_kind']}   (an edge can carry more than one kind)")
-        print(f"  Coverage bonus W = {s['W']:.3f}   |coefficients| in [{s['coeff_range'][0]:.3f}, {s['coeff_range'][1]:.3f}]"
-              f"   smallest weight difference: {s['smallest_weight_gap']:.2e}")
+    def collect(G, w, cap):
+        problems.append((current["t"], G.copy(), dict(w), cap))
+        return greedy_oracle(G, w, cap)
 
-        ## Energy of the greedy's slot, from the matrix vs from the formula
-        greedy_slot = pf_schedule(G, 1)["schedule"][0]
-        primary = []
-        for k in sorted({n[0] for n in greedy_slot}):
-            mine = [n for n in greedy_slot if n[0] == k]
-            primary.append(max(mine, key=lambda n: (G.nodes[n]["weight"], -n[1])))
-        e_matrix = energy(qubo, encode(qubo, primary))
-        e_formula = -sum(qubo["w_prime"][n] for n in primary)
-        independent = not any(qubo["H"].has_edge(a, b) for a, b in itertools.combinations(primary, 2))
-        print("  Check 1 - greedy slot 0, one primary link per UE:")
-        print(f"    independent in H: {independent}   E(matrix) = {e_matrix:.6f}   "
-              f"E(formula) = {e_formula:.6f}   match: {abs(e_matrix - e_formula) < 1e-9}")
-        e_full = energy(qubo, encode(qubo, greedy_slot))
-        print(f"    full greedy slot ({len(greedy_slot)} links, several per UE): E = {e_full:.3f} "
-              f"(> primary-only, as expected: same-UE pairs are penalised)")
-        print(f"    complete_slot(primary) reproduces the greedy slot: "
-              f"{complete_slot(G, primary) == greedy_slot}")
+    M_prev = None
+    for t, s in enumerate(snapshots):
+        current["t"] = t
+        M_prev, _, _ = assign_users_to_antennas(
+            s, CAPACITY, RANGE_M, M_prev=M_prev, alpha_quality=ALPHA_QUALITY, alpha_continuity=ALPHA_CONTINUITY,
+            max_se=MAX_SE, constraints=constraints, compatible=best_antennas(BEST_APS),
+            oracle=collect, max_candidates=MAX_QUBO_USERS)
 
-        ## Exhaustive check on a real contested cluster
-        sub = G.subgraph([n for n in G.nodes if n[0] in cluster]).copy()
-        q = build_qubo(sub)
-        n = len(q["variables"])
-        states = ((np.arange(2 ** n)[:, None] >> np.arange(n)[None, :]) & 1).astype(float)
-        E = energy(q, states)
-        order = np.argsort(E, kind="stable")
-        best = decode(q, states[order[0]])
+    ## 2. Their QUBOs
+    qubos = [build_antenna_qubo(G, w, cap if CAPACITY_IN_QUBO else None, PENALTY_FACTOR)
+             for _, G, w, cap in problems]
+    print(f"K={K}, L={L}, T={T}, seed {SEED}, capacity {CAPACITY} "
+          f"({'in the QUBO' if CAPACITY_IN_QUBO else 'by prune, not in the QUBO'}): {len(qubos)} antenna QUBOs")
+    print("  E(x) = - sum w_u x_u + sum_soft J_uv x_u x_v + P sum_hard x_u x_v"
+          + (" + lam (sum x_u + sum c_j s_j - C)^2" if CAPACITY_IN_QUBO else ""))
+    print(f"  w_u = {ALPHA_QUALITY:g} * SE(u,a) / {MAX_SE:g} + {ALPHA_CONTINUITY:g} * [a served u in s-1]   "
+          f"J_uv = {ALPHA_LEAK:g} * expected SE lost to leakage (adjacent with p = {P_ADJACENT:.2f}) / {MAX_SE:g}   "
+          f"hard: users < {MIN_SEP_M:g} m apart")
 
-        H = q["H"]
-        def is_independent(links):
-            return not any(H.has_edge(a, b) for a, b in itertools.combinations(links, 2))
-        def covers(links):
-            return {m[0] for m in links} == set(cluster)
+    ## 3. One QUBO in full
+    if EXAMPLE is None:
+        i_ex = max(range(len(qubos)), key=lambda i: (qubos[i]["Q"].shape[0], problems[i][1].number_of_edges()))
+    else:
+        i_ex = next(i for i, p in enumerate(problems) if (p[0], p[1].graph["antenna"]) == tuple(EXAMPLE))
+    t_ex, G_ex, w_ex, cap_ex = problems[i_ex]
+    print()
+    print_qubo(G_ex, w_ex, qubos[i_ex], f"Example: slot {t_ex}, antenna {G_ex.graph['antenna']}, capacity {cap_ex}")
 
-        ## Reference, computed separately: best "one AP per UE, all APs different"
-        options = [[m for m in q["variables"] if m[0] == k] for k in cluster]
-        ref, ref_w = None, -np.inf
-        for combo in itertools.product(*options):
-            if len({m[1] for m in combo}) == len(combo) and is_independent(combo):
-                wsum = sum(q["w_norm"][m] for m in combo)
-                if wsum > ref_w:
-                    ref, ref_w = sorted(combo), wsum
+    ## 4. All QUBOs
+    S = [qubo_summary(q) for q in qubos]
+    v = np.array([s["variables"] for s in S])
+    over = sum(G.number_of_nodes() > cap for _, G, _, cap in problems)
+    print()
+    print(f"  All QUBOs: variables mean {v.mean():.1f}, 90% {np.percentile(v, 90):.0f}, max {v.max()}   "
+          f"more users than capacity: {over}/{len(qubos)}")
+    print(f"    couplings mean {np.mean([s['couplings'] for s in S]):.1f}, density mean "
+          f"{np.mean([s['density'] for s in S]):.0%}   |coefficients| in "
+          f"[{min(s['coeff_min'] for s in S):.3f}, {max(s['coeff_max'] for s in S):.2f}]   "
+          f"off-diagonal >= 0 in all: {all(s['off_diagonal_nonnegative'] for s in S)}")
 
-        invalid = [i for i in order if not (is_independent(decode(q, states[i])) and covers(decode(q, states[i])))]
-        print(f"  Check 2 - exhaustive, UEs {cluster} ({n} qubits, {2**n} states):")
-        print(f"    lowest-energy state: {best}")
-        print(f"    independent: {is_independent(best)}   covers every UE: {covers(best)}   "
-              f"= best covering assignment: {best == ref}")
-        print(f"    energy gap to the best INVALID state: {E[invalid[0]] - E[order[0]]:.3f}")
-        print()
+    ## 5. Check and reference values.
+    ##    References saved per QUBO: ground state, exact optimum with capacity.
+    records, ok, checked = [], 0, 0
+    for (t, G, w, cap), q in zip(problems, qubos):
+        ref, N = {}, q["Q"].shape[0]
+        if N <= 22:
+            X = ((np.arange(2 ** N)[:, None] >> np.arange(N)[None, :]) & 1).astype(float)
+            E = energy(q, X)
+            if not q["slack"]:
+                values = np.array([antenna_objective(G, w, decode(q, x)) for x in X])
+                feasible = values > -np.inf
+                ok += bool(np.allclose(E[feasible], -values[feasible]) and (E[~feasible] > E.min()).all())
+            else:
+                ok += abs(-E.min() - exact_antenna(G, w, cap)[0]) < 1e-9
+            checked += 1
+            ref["ground_energy"] = float(E.min())
+            ref["ground_users"] = [int(u) for u in decode(q, X[int(np.argmin(E))])]
+        best, best_S = exact_antenna(G, w, cap)
+        ref["optimum_value"] = float(best)
+        ref["optimum_users"] = [int(u) for u in best_S]
+        records.append(problem_record(t, G, w, cap, q, ref))
+    print(f"  Formulation check: {ok}/{checked} QUBOs correct on every state (<= 22 variables)")
+    if not CAPACITY_IN_QUBO:
+        within = sum(len(r["reference"].get("ground_users", [])) <= r["capacity"] for r in records)
+        print(f"    ground state already within capacity (no prune needed): {within}/{checked}")
+
+    ## 6. Save
+    params = dict(K=K, L=L, T=T, seed=SEED, capacity=CAPACITY, range_m=RANGE_M, best_aps=BEST_APS,
+                  max_qubo_users=MAX_QUBO_USERS, alpha_quality=ALPHA_QUALITY, alpha_continuity=ALPHA_CONTINUITY,
+                  max_se=MAX_SE, min_sep_m=MIN_SEP_M, alpha_leak=ALPHA_LEAK, leakage_db=LEAKAGE_DB, p_adjacent=P_ADJACENT,
+                  capacity_in_qubo=CAPACITY_IN_QUBO, penalty_factor=PENALTY_FACTOR)
+    save_qubos(OUT, params, records)
+    print(f"  Saved {len(records)} QUBOs to {OUT}")
