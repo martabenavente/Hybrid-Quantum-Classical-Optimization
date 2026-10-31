@@ -196,6 +196,66 @@ def problem_qubo(rec):
             "n_users": rec["n_users"], "slack": rec["slack"], "P": rec["P"], "lam": rec["lam"]}
 
 
+## Hub split: decide the users with many couplings before the QPU
+##   x_h = 0: h and its edges are removed.
+##   x_h = 1: h is removed and counted as served (value + w_h, capacity - 1),
+##            its hard partners are removed (they can no longer be served),
+##            each soft neighbour v pays the coupling on its own: w_v -> w_v - J_hv
+##            (DMM). Users left with w <= 0
+##            are removed too (with couplings >= 0 they can never pay off).
+## The best branch is the optimum of the original problem.
+
+def condition_branch(G, weights, capacity, h, served):
+    """Branch of (G, weights, capacity) with user h fixed. Returns (G, weights, capacity, value of h)."""
+    if not served:
+        keep = [u for u in G.nodes if u != h]
+        return G.subgraph(keep).copy(), {u: weights[u] for u in keep}, capacity, 0.0
+    w = {u: weights[u] for u in G.nodes if u != h}
+    for v in G.neighbors(h):
+        if G.edges[h, v]["hard"]:
+            w.pop(v, None)
+        else:
+            w[v] -= G.edges[h, v]["weight"]
+    keep = [u for u in w if w[u] > 1e-12] if capacity > 1 else []
+    return G.subgraph(keep).copy(), {u: w[u] for u in keep}, capacity - 1, float(weights[h])
+
+
+def split_hubs(G, weights, capacity, max_degree=6, max_hubs=2):
+    """
+    Branches with the hubs decided.
+    Returns a list of dicts: G, weights, capacity, served (hubs fixed to 1), value (sum of their weights).
+    Without hubs: one branch, the problem itself.
+    """
+    branches = [{"G": G, "weights": dict(weights), "capacity": capacity, "served": [], "value": 0.0, "fixed": 0}]
+    for _ in range(max_hubs):
+        new, split = [], False
+        for b in branches:
+            deg = dict(b["G"].degree())
+            hub = max(deg, key=lambda u: (deg[u], b["weights"][u], -u), default=None)
+            if hub is None or deg[hub] <= max_degree or b["capacity"] < 1:
+                new.append(b)
+                continue
+            split = True
+            for served in (False, True):
+                Gb, wb, cb, val = condition_branch(b["G"], b["weights"], b["capacity"], hub, served)
+                new.append({"G": Gb, "weights": wb, "capacity": cb, "served": b["served"] + ([hub] if served else []),
+                            "value": b["value"] + val, "fixed": b["fixed"] + 1})
+        branches = new
+        if not split:
+            break
+    return branches
+
+
+def exact_split(G, weights, capacity, max_degree=6, max_hubs=2):
+    """Optimum via the hub branches: must equal exact_antenna."""
+    best, best_S = 0.0, []
+    for b in split_hubs(G, weights, capacity, max_degree, max_hubs):
+        v, S = exact_antenna(b["G"], b["weights"], b["capacity"]) if b["G"].number_of_nodes() else (0.0, [])
+        if b["value"] + v > best + 1e-12:
+            best, best_S = b["value"] + v, b["served"] + S
+    return best, best_S
+
+
 if __name__ == "__main__":
 
     from dynamic_scenario import DynamicScenario, CARRIER_HZ
